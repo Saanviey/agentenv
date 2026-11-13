@@ -1,0 +1,4 @@
+[model]
+name = "qwen2.5-coder:7b"
+url = "http://localhost:11434"
+timeout_s = 120
