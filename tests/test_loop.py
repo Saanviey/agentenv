@@ -2,6 +2,7 @@ import unittest
 from runtime.loop import run_agent, REMINDER, CUT_OFF
 from runtime.tools import default_tools
 from runtime.types import Message
+from runtime.model.base import ModelBadOutput
 from tests.fakes import FakeClient, call, text
 
 START = [Message("system", "s"), Message("user", "task")]
@@ -66,6 +67,16 @@ class Stopping(unittest.TestCase):
     def test_max_steps(self):
         r, _ = run([call("get_time")] * 3, max_steps=3)
         self.assertEqual((r.stopped, r.steps), ("max_steps", 3))
+
+class BadOutput(unittest.TestCase):
+    def test_server_rejected_call_is_shown_to_model(self):
+        r, c = run([ModelBadOutput("400", '{"name": "answer", "arguments": oops}'), call("finish", {"answer": "ok"})])
+        self.assertEqual(r.stopped, "finish")
+        self.assertIn("oops", c.calls[1][-1].content)
+
+    def test_gives_up_after_repeated_bad_calls(self):
+        with self.assertRaises(ModelBadOutput):
+            run([ModelBadOutput("400", "x")] * 3)
 
 class Repeats(unittest.TestCase):
     def test_repeat_call_gets_note(self):

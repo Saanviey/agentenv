@@ -16,3 +16,5 @@ timeout_s = 60
 [agent]
 workspace = "."   # folder the file tools may read
 max_steps = 10    # model calls per run before giving up
+approval = "ask"  # "ask": prompt before writes/commands; "auto": allow all the policy allows
+command_timeout_s = 30

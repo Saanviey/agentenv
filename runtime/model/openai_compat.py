@@ -1,6 +1,6 @@
 import json, time, uuid, httpx
 from runtime.types import Message, Response, ToolCall
-from runtime.model.base import ModelClient, ModelError, ModelUnavailable, ModelTimeout, ModelRateLimited
+from runtime.model.base import ModelClient, ModelError, ModelUnavailable, ModelTimeout, ModelRateLimited, ModelBadOutput
 from runtime.model.fallback import parse_text_tool_call
 
 # Adapter for any OpenAI-compatible chat API: Groq, OpenRouter, Cerebras, Ollama's /v1, OpenAI itself.
@@ -29,6 +29,12 @@ class OpenAICompatClient(ModelClient):
                 wait = e.response.headers.get("retry-after")  # server's hint, in seconds
                 raise ModelRateLimited(f"429 rate limited: {text}",
                                        float(wait) if wait and wait.replace(".", "", 1).isdigit() else None) from e
+            if code == 400 and "tool_use_failed" in text:  # Groq checks tool-call JSON server-side and refuses bad ones
+                try:
+                    gen = e.response.json()["error"].get("failed_generation", "")
+                except Exception:
+                    gen = ""
+                raise ModelBadOutput(f"malformed tool call: {text}", gen) from e
             if code >= 500:
                 raise ModelUnavailable(f"{code} server error: {text}") from e
             raise ModelError(f"{code}: {text}") from e  # 401 bad key, 400 bad request, 404 unknown model

@@ -9,6 +9,10 @@ class ModelRateLimited(ModelError):       # HTTP 429, too many requests -> retry
     def __init__(self, msg: str, retry_after: float | None = None):
         super().__init__(msg)
         self.retry_after = retry_after       # seconds the server asked us to wait, if it said
+class ModelBadOutput(ModelError):          # the model produced a broken tool call the server refused -> tell the model, let it retry
+    def __init__(self, msg: str, generation: str = ""):
+        super().__init__(msg)
+        self.generation = generation          # what the model actually wrote, if the server shared it
 
 # Interface every backend implements. ABC: can't be instantiated directly.
 class ModelClient(ABC):

@@ -1,19 +1,25 @@
 import json, logging
 from dataclasses import dataclass
 from runtime.types import Message
-from runtime.model.base import ModelClient
-from runtime.tools import ToolRegistry, FINISH
+from runtime.model.base import ModelClient, ModelBadOutput
+from runtime.tools import ToolRegistry, FINISH, parse_args
+from runtime import policy
+from runtime.policy import Approver, deny_all
 
 log = logging.getLogger("runtime.loop")
 
 SYSTEM_PROMPT = """You are a coding assistant working inside the user's project folder.
 Use the provided tools to act. Paths are relative to the project root.
 Never describe a file you have not read with read_file.
+To change code: read the file, change it with edit_file (exact old text -> new text), then run the tests with run_command to check.
+If an action is blocked or not approved, do not retry it; try another way or call finish and explain.
 Every reply must be a tool call. Never write the answer as plain text.
 When you have the answer, put it only inside the finish tool's answer argument, short and to the point.
 If the task needs no other tool, call finish right away."""
 
 REMINDER = "Your reply was plain text, not a tool call. Call a tool, or put your answer inside finish."
+BAD_CALL = ("Your last tool call was malformed (arguments were not valid JSON), so it was not run. You wrote:\n{gen}\n"
+            "Call the tool again with valid JSON arguments.")
 CUT_OFF = "Your reply was cut off because it was too long. Call a tool, or call finish with a shorter answer."
 REPEAT_NOTE = "\n\nnote: you already made this exact call {n} time(s) before; the result has not changed. Use it and move on."
 
@@ -30,13 +36,21 @@ class RunResult:
 # In: client, tools, starting messages, limits. Out: RunResult. Raises: ModelError.
 # Repeats: call model -> run the tools it asked for -> append results, until it calls finish.
 def run_agent(client: ModelClient, tools: ToolRegistry, messages: list[Message],
-              max_steps: int = 10, max_reminders: int = 2) -> RunResult:
+              max_steps: int = 10, max_reminders: int = 2, approve: Approver = deny_all) -> RunResult:
     messages = list(messages)  # copy; don't mutate the caller's list
     in_tok = out_tok = reminders = 0
     seen: dict[str, int] = {}  # call signature -> times called, to spot repeats (B13)
 
     for step in range(1, max_steps + 1):
-        resp = client.complete(messages, tools.schemas())
+        try:
+            resp = client.complete(messages, tools.schemas())
+        except ModelBadOutput as e:  # model's mistake, not the server's: show it and let it try again
+            reminders += 1
+            log.info("  malformed tool call (%d/%d): %s", reminders, max_reminders, _preview(e.generation or str(e)))
+            if reminders > max_reminders:
+                raise
+            messages.append(Message("user", BAD_CALL.format(gen=e.generation[:500] or "(not shown)")))
+            continue
         in_tok += resp.input_tokens
         out_tok += resp.output_tokens
         messages.append(resp.message)
@@ -59,7 +73,7 @@ def run_agent(client: ModelClient, tools: ToolRegistry, messages: list[Message],
                     return RunResult(answer, messages, step, in_tok, out_tok, "finish")
                 result = "error: finish needs a non-empty 'answer'"
             else:
-                result = tools.run(call.name, call.arguments)
+                result = _gate(call, tools, approve) or tools.run(call.name, call.arguments)
                 key = _signature(call.name, call.arguments)
                 if seen.get(key):
                     result += REPEAT_NOTE.format(n=seen[key])
@@ -69,6 +83,21 @@ def run_agent(client: ModelClient, tools: ToolRegistry, messages: list[Message],
 
     log.warning("hit max_steps=%d without finish", max_steps)
     return RunResult("(stopped: step limit reached)", messages, max_steps, in_tok, out_tok, "max_steps")
+
+# Policy + approval before a tool runs. Out: error text if blocked, None if it may run.
+def _gate(call, tools: ToolRegistry, approve: Approver) -> str | None:
+    tool = tools.get(call.name)
+    args, err = parse_args(call.arguments)
+    if tool is None or err:
+        return None  # tools.run() reports unknown tools and bad args
+    d = policy.check(tool, args)
+    if d.action == "deny":
+        log.warning("  BLOCKED %s: %s", call.name, d.reason)
+        return f"error: blocked by policy: {d.reason}"
+    if d.action == "ask" and not approve(call.name, args, d.reason):
+        log.warning("  NOT APPROVED %s: %s", call.name, d.reason)
+        return "error: the user did not approve this action. Do not retry it; try another way or call finish."
+    return None
 
 # Same tool + same args -> same string, regardless of key order.
 def _signature(name: str, args) -> str:
