@@ -26,7 +26,9 @@ class OpenAICompatClient(ModelClient):
         except httpx.HTTPStatusError as e:
             code, text = e.response.status_code, e.response.text[:500]
             if code == 429:
-                raise ModelRateLimited(f"429 rate limited: {text}") from e
+                wait = e.response.headers.get("retry-after")  # server's hint, in seconds
+                raise ModelRateLimited(f"429 rate limited: {text}",
+                                       float(wait) if wait and wait.replace(".", "", 1).isdigit() else None) from e
             if code >= 500:
                 raise ModelUnavailable(f"{code} server error: {text}") from e
             raise ModelError(f"{code}: {text}") from e  # 401 bad key, 400 bad request, 404 unknown model

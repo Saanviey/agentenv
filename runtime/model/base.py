@@ -5,7 +5,10 @@ from runtime.types import Message, Response
 class ModelError(Exception): ...
 class ModelUnavailable(ModelError): ...   # server down -> retryable
 class ModelTimeout(ModelError): ...       # too slow    -> retryable
-class ModelRateLimited(ModelError): ...   # HTTP 429, too many requests -> retry after waiting
+class ModelRateLimited(ModelError):       # HTTP 429, too many requests -> retry after waiting
+    def __init__(self, msg: str, retry_after: float | None = None):
+        super().__init__(msg)
+        self.retry_after = retry_after       # seconds the server asked us to wait, if it said
 
 # Interface every backend implements. ABC: can't be instantiated directly.
 class ModelClient(ABC):

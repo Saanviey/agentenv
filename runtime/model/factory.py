@@ -1,8 +1,12 @@
 from runtime.model.base import ModelClient
+from runtime.model.retry import RetryingClient
 from runtime.config import ConfigError
 
-# In: one model profile from model_config(). Out: the matching client.
+# In: one model profile from model_config(). Out: the matching client, wrapped with retries.
 def build_client(m: dict) -> ModelClient:
+    return RetryingClient(_backend(m), attempts=m.get("retries", 3))
+
+def _backend(m: dict) -> ModelClient:
     if m["provider"] == "ollama":
         from runtime.model.ollama import OllamaClient
         return OllamaClient(m["name"], m["url"], m["timeout_s"])
