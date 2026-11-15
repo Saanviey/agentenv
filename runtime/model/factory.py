@@ -3,8 +3,8 @@ from runtime.model.retry import RetryingClient
 from runtime.config import ConfigError
 
 # In: one model profile from model_config(). Out: the matching client, wrapped with retries.
-def build_client(m: dict) -> ModelClient:
-    return RetryingClient(_backend(m), attempts=m.get("retries", 3))
+def build_client(m: dict, on_retry=None) -> ModelClient:
+    return RetryingClient(_backend(m), attempts=m.get("retries", 3), on_retry=on_retry)
 
 def _backend(m: dict) -> ModelClient:
     if m["provider"] == "ollama":
