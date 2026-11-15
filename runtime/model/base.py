@@ -5,10 +5,11 @@ from runtime.types import Message, Response
 class ModelError(Exception): ...
 class ModelUnavailable(ModelError): ...   # server down -> retryable
 class ModelTimeout(ModelError): ...       # too slow    -> retryable
+class ModelRateLimited(ModelError): ...   # HTTP 429, too many requests -> retry after waiting
 
 # Interface every backend implements. ABC: can't be instantiated directly.
 class ModelClient(ABC):
     # Q4: stateless. The caller passes the FULL history every time; the client stores nothing.
-    # In: full history. Out: next reply. Raises: ModelError.
+    # In: full history + tool schemas. Out: next reply (text and/or tool calls). Raises: ModelError.
     @abstractmethod  # subclasses must define this
-    def complete(self, messages: list[Message]) -> Response: ...
+    def complete(self, messages: list[Message], tools: list[dict] | None = None) -> Response: ...

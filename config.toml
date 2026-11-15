@@ -1,4 +1,18 @@
-[model]
+model = "groq"   # which [models.<name>] profile to use
+
+[models.ollama]
+provider = "ollama"
 name = "qwen2.5-coder:7b"
 url = "http://localhost:11434"
-timeout_s = 120
+timeout_s = 300
+
+[models.groq]
+provider = "openai_compat"
+name = "openai/gpt-oss-120b"        # check console.groq.com for current models with tool use
+url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"       # name of the env var holding the key; the key never goes in this file
+timeout_s = 60
+
+[agent]
+workspace = "."   # folder the file tools may read
+max_steps = 10    # model calls per run before giving up
