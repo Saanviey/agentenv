@@ -8,6 +8,7 @@ from runtime.tools import default_tools
 from runtime.loop import run_agent, SYSTEM_PROMPT
 from runtime.policy import ask_user, approve_all
 from runtime.trace import new_trace
+from runtime.verify import CodingVerifier
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")  # logs to stderr
 logging.getLogger("httpx").setLevel(logging.WARNING)  # hide httpx's per-request lines; the loop logs each step
@@ -46,7 +47,9 @@ def main():
         Message("user", task),
     ]
     try:
-        result = run_agent(client, tools, messages, a.get("max_steps", 10), approve=approve, trace=trace)
+        verifier = CodingVerifier(a.get("test_command") or None, a.get("command_timeout_s", 30) * 4)
+        result = run_agent(client, tools, messages, a.get("max_steps", 10), approve=approve, trace=trace,
+                           verifier=verifier, rollback=a.get("rollback", True))
     except ModelError as e:
         log.error("model call failed: %s", e)
         log.info("trace: %s", trace.path)

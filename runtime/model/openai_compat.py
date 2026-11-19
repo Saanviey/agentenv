@@ -1,4 +1,4 @@
-import json, time, uuid, httpx
+import json, re, time, uuid, httpx
 from runtime.types import Message, Response, ToolCall
 from runtime.model.base import ModelClient, ModelError, ModelUnavailable, ModelTimeout, ModelRateLimited, ModelBadOutput
 from runtime.model.fallback import parse_text_tool_call
@@ -24,12 +24,13 @@ class OpenAICompatClient(ModelClient):
         except httpx.TimeoutException as e:
             raise ModelTimeout(str(e)) from e
         except httpx.HTTPStatusError as e:
-            code, text = e.response.status_code, e.response.text[:500]
+            code = e.response.status_code
+            text = re.sub(r"org_[A-Za-z0-9]+", "org_***", e.response.text[:500])  # don't copy account ids into traces/results
             if code == 429:
                 wait = e.response.headers.get("retry-after")  # server's hint, in seconds
                 raise ModelRateLimited(f"429 rate limited: {text}",
                                        float(wait) if wait and wait.replace(".", "", 1).isdigit() else None) from e
-            if code == 400 and "tool_use_failed" in text:  # Groq checks tool-call JSON server-side and refuses bad ones
+            if code == 400 and ("tool_use_failed" in text or "output_parse_failed" in text):  # Groq refused what the model wrote
                 try:
                     gen = e.response.json()["error"].get("failed_generation", "")
                 except Exception:

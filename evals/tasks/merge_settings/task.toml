@@ -1,0 +1,3 @@
+prompt = """The tests in this project fail. Find and fix the bug in the source code (not the tests) so that all tests pass."""
+protect = ["test_*.py"]   # restored before checking, so editing tests can't make a task pass
+max_steps = 15

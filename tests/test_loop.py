@@ -78,6 +78,40 @@ class BadOutput(unittest.TestCase):
         with self.assertRaises(ModelBadOutput):
             run([ModelBadOutput("400", "x")] * 3)
 
+class FinishAliases(unittest.TestCase):
+    def test_server_rejected_alias_is_salvaged(self):
+        r, _ = run([ModelBadOutput("400", '{"name": "commentary", "arguments": {"answer": "fixed it"}}')])
+        self.assertEqual((r.stopped, r.answer), ("finish", "fixed it"))
+
+    def test_plain_text_answer_json_is_salvaged(self):
+        r, _ = run([text('{"answer": "All tests pass."}')])
+        self.assertEqual((r.stopped, r.answer), ("finish", "All tests pass."))
+
+    def test_structured_alias_call(self):
+        r, _ = run([call("final", {"answer": "done"})])
+        self.assertEqual((r.stopped, r.answer), ("finish", "done"))
+
+    def test_other_tool_in_text_is_not_a_finish(self):
+        r, _ = run([text('{"name": "read_file", "arguments": {"answer": "x"}}'), call("finish", {"answer": "ok"})])
+        self.assertEqual(r.steps, 2)
+
+    def test_nested_wrapper_is_unwrapped(self):
+        gen = '{"name": "json", "arguments": {"name": "finish", "arguments": {"answer": "all good"}}}'
+        r, _ = run([ModelBadOutput("400", gen)])
+        self.assertEqual((r.stopped, r.answer), ("finish", "all good"))
+
+    def test_unknown_structured_call_without_answer_is_not_finish(self):
+        r, _ = run([call("final", {"text": "x"}), call("finish", {"answer": "ok"})])
+        self.assertEqual(r.steps, 2)
+
+    def test_broken_json_is_not_salvaged(self):
+        r, _ = run([ModelBadOutput("400", '{"name": "answer", "arguments": All tests pass."}'), call("finish", {"answer": "ok"})])
+        self.assertEqual(r.steps, 2)
+
+    def test_empty_answer_is_not_salvaged(self):
+        r, _ = run([text('{"answer": "  "}'), call("finish", {"answer": "ok"})])
+        self.assertEqual(r.steps, 2)
+
 class Repeats(unittest.TestCase):
     def test_repeat_call_gets_note(self):
         r, _ = run([call("list_dir", {"path": "runtime"}), call("list_dir", {"path": "runtime"}),

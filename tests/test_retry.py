@@ -30,6 +30,16 @@ class Retry(unittest.TestCase):
         c.complete([])
         self.assertEqual(waits, [7])
 
+    def test_rate_limits_get_more_attempts(self):
+        c, waits = client([ModelRateLimited("429")] * 5 + [text("hi")])
+        self.assertEqual(c.complete([]).message.content, "hi")
+        self.assertEqual(len(waits), 5)
+
+    def test_short_retry_after_does_not_undercut_backoff(self):
+        c, waits = client([ModelRateLimited("429", retry_after=0.5)] * 3 + [text("hi")])
+        c.complete([])
+        self.assertEqual(waits, [1, 2, 4])
+
     def test_caps_long_waits(self):
         c, waits = client([ModelRateLimited("429", retry_after=600), text("hi")])
         c.complete([])

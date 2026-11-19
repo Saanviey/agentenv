@@ -3,10 +3,19 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Literal
+from runtime.session import Session
 
 MAX_OUTPUT = 8000   # chars; stops one tool result from flooding the context window
 FINISH = "finish"   # the loop ends the run when the model calls this tool
 SECRET_WORDS = ("KEY", "TOKEN", "SECRET", "PASSWORD")  # env vars with these in the name are hidden from commands
+
+# Out: a copy of the environment without secrets (API keys etc.), for anything we run.
+def safe_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if not any(w in k.upper() for w in SECRET_WORDS)}
+    # No .pyc cache: Python checks it by mtime (1 s resolution) + size, so a same-size edit within a second
+    # (a * b -> a + b) would run the OLD compiled code (B19).
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
 
 Risk = Literal["read", "write", "exec"]  # read = no side effects; write = changes files; exec = runs a program
 
@@ -40,8 +49,9 @@ def parse_args(args: Any) -> tuple[dict | None, str | None]:
 
 # Holds the available tools; the loop asks it for schemas and to run calls.
 class ToolRegistry:
-    def __init__(self):
+    def __init__(self, session: Session | None = None):
         self._tools: dict[str, Tool] = {}
+        self.session = session  # what the tools did this run (evidence + snapshots); None = not tracked
 
     def add(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
@@ -90,6 +100,7 @@ class ToolRegistry:
 # In: workspace folder the tools may touch, max seconds per command. Out: registry with all tools.
 def default_tools(root: str | Path = ".", command_timeout_s: float = 30) -> ToolRegistry:
     root = Path(root).resolve()
+    session = Session(root)
 
     # Resolves a model-given path and refuses anything outside root (../, absolute paths, symlinks out).
     def safe_path(p: str) -> Path:
@@ -112,16 +123,35 @@ def default_tools(root: str | Path = ".", command_timeout_s: float = 30) -> Tool
         if not f.is_file():
             raise ToolError(f"'{path}' is not a file")
         try:
-            return f.read_text()
+            text = f.read_text()
         except UnicodeDecodeError:
             raise ToolError(f"'{path}' is not a text file")
+        session.note_read(str(f.relative_to(root)))
+        return text
+
+    # Every file change goes through here: snapshot the original, write, and undo at once if Python no longer parses.
+    def change(f: Path, new_text: str) -> None:
+        rel = str(f.relative_to(root))
+        before = f.read_text() if f.is_file() else None
+        session.before_change(rel, before)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(new_text)
+        if f.suffix == ".py":
+            try:
+                compile(new_text, rel, "exec")  # parse only, nothing runs
+            except SyntaxError as e:
+                if before is None:
+                    f.unlink()
+                else:
+                    f.write_text(before)
+                raise ToolError(f"that change would make {rel} invalid Python ({e.msg}, line {e.lineno}), so it was undone. "
+                                "Fix the code and try again.")
 
     def write_file(path: str, content: str) -> str:
         f = safe_path(path)
         if f.is_dir():
             raise ToolError(f"'{path}' is a directory")
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(content)
+        change(f, content)
         return f"wrote {len(content)} chars to {path}"
 
     def edit_file(path: str, old: str, new: str) -> str:
@@ -134,27 +164,36 @@ def default_tools(root: str | Path = ".", command_timeout_s: float = 30) -> Tool
             raise ToolError(f"old text not found in {path}. read_file it and copy the exact text, including spaces")
         if n > 1:
             raise ToolError(f"old text appears {n} times in {path}. include more surrounding lines so it matches once")
-        f.write_text(text.replace(old, new, 1))
+        change(f, text.replace(old, new, 1))
         return f"edited {path}: replaced 1 occurrence"
 
+    def revert_file(path: str) -> str:
+        f = safe_path(path)
+        rel = str(f.relative_to(root))
+        if rel not in session.snapshots:
+            raise ToolError(f"you haven't changed {path} in this run, so there is nothing to revert")
+        session.restore(rel)
+        return f"restored {path} to how it was at the start of the run"
+
     def run_command(command: str) -> str:
-        env = {k: v for k, v in os.environ.items() if not any(w in k.upper() for w in SECRET_WORDS)}
         try:
-            p = subprocess.run(command, shell=True, cwd=root, env=env, capture_output=True, text=True,
+            p = subprocess.run(command, shell=True, cwd=root, env=safe_env(), capture_output=True, text=True,
                                timeout=command_timeout_s, stdin=subprocess.DEVNULL)
             # shell=True: run through /bin/sh so pipes work; cwd=root: commands start in the workspace;
             # capture_output: collect stdout/stderr instead of printing; stdin=DEVNULL: a command waiting for input fails instead of hanging
         except subprocess.TimeoutExpired:
+            session.note_command(command, None, "")
             raise ToolError(f"command timed out after {command_timeout_s}s")
         out = f"exit code: {p.returncode}"
         if p.stdout:
             out += f"\n--- stdout ---\n{p.stdout}"
         if p.stderr:
             out += f"\n--- stderr ---\n{p.stderr}"
+        session.note_command(command, p.returncode, out)
         return out
 
     path_prop = {"type": "string", "description": "Path relative to the project root."}
-    reg = ToolRegistry()
+    reg = ToolRegistry(session)
     reg.add(Tool(
         "list_dir", "List a directory. Returns paths relative to the project root; folders end with '/'.",
         {"type": "object",
@@ -176,6 +215,10 @@ def default_tools(root: str | Path = ".", command_timeout_s: float = 30) -> Tool
                                           "new": {"type": "string", "description": "Replacement text."}},
          "required": ["path", "old", "new"]},
         edit_file, risk="write"))
+    reg.add(Tool(
+        "revert_file", "Undo all your changes to one file in this run, restoring it to how it was at the start.",
+        {"type": "object", "properties": {"path": path_prop}, "required": ["path"]},
+        revert_file, risk="write"))
     reg.add(Tool(
         "run_command", f"Run a shell command in the project root (e.g. tests). Returns exit code, stdout and stderr. Times out after {command_timeout_s:g}s.",
         {"type": "object", "properties": {"command": {"type": "string", "description": "Shell command to run."}},
