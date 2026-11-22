@@ -13,6 +13,8 @@ class ModelBadOutput(ModelError):          # the model produced a broken tool ca
     def __init__(self, msg: str, generation: str = ""):
         super().__init__(msg)
         self.generation = generation          # what the model actually wrote, if the server shared it
+class ModelQuotaExceeded(ModelError): ...    # daily/monthly allowance used up: waiting minutes won't help -> not retried (B29)
+class ModelContextOverflow(ModelError): ...  # request too big for the model / rate limit (HTTP 413) -> shrink the context, retry
 
 # Interface every backend implements. ABC: can't be instantiated directly.
 class ModelClient(ABC):

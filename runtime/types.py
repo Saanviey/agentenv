@@ -18,6 +18,7 @@ class Message:
     tool_call_id: str | None = None   # only for role="tool"
     tool_name: str | None = None      # only for role="tool"
     tool_calls: list[ToolCall] = field(default_factory=list)  # only for role="assistant"
+    tag: str = ""                     # runtime bookkeeping, never sent: "summary" | "elided"
 
 # Result of one model call: the reply + metadata.
 @dataclass

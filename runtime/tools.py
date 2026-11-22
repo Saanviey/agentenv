@@ -1,11 +1,14 @@
-import json, os, subprocess
+import json, os, re, subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Literal
 from runtime.session import Session
 
-MAX_OUTPUT = 8000   # chars; stops one tool result from flooding the context window
+OFFLOAD_CHARS = 4000  # results longer than this are stored outside the conversation; the model sees a preview
+PREVIEW_HEAD, PREVIEW_TAIL = 2000, 800
+PAGE_CHARS = 3500     # max chars read_output returns at once (below OFFLOAD_CHARS, so pages are never offloaded again)
+SKIP_DIRS = {".git", ".venv", "node_modules", "__pycache__"}
 FINISH = "finish"   # the loop ends the run when the model calls this tool
 SECRET_WORDS = ("KEY", "TOKEN", "SECRET", "PASSWORD")  # env vars with these in the name are hidden from commands
 
@@ -31,6 +34,7 @@ class Tool:
     parameters: dict[str, Any]   # JSON Schema for the arguments
     fn: Callable[..., str]
     risk: Risk = "read"          # the policy uses this to decide allow / ask
+    aliases: dict[str, str] | None = None  # other names models use for an argument, e.g. line_start -> start_line (B26)
 
 
 # In: arguments as the model sent them. Out: (dict, None) or (None, error text).
@@ -78,6 +82,9 @@ class ToolRegistry:
         args, err = parse_args(args)
         if err:
             return f"error: {name}: {err}"
+        for alias, real in (tool.aliases or {}).items():
+            if alias in args and real not in args:
+                args[real] = args.pop(alias)
 
         props = tool.parameters.get("properties", {})
         missing = [k for k in tool.parameters.get("required", []) if k not in args]
@@ -92,10 +99,26 @@ class ToolRegistry:
         except Exception as e:  # a bug in the tool shouldn't crash the loop
             return f"error: {name} failed: {type(e).__name__}: {e}"
 
-        if len(out) > MAX_OUTPUT:
-            out = out[:MAX_OUTPUT] + f"\n...[truncated {len(out) - MAX_OUTPUT} chars]"
-        return out
+        return self._offload(out) if len(out) > OFFLOAD_CHARS else out
 
+    # Big result: keep the full text in the session, give the model the start and end + how to get the rest.
+    def _offload(self, out: str) -> str:
+        if self.session is None:  # nowhere to store it: plain cut
+            return out[:OFFLOAD_CHARS] + f"\n...[cut: {len(out) - OFFLOAD_CHARS} more chars]"
+        oid = self.session.store_output(out)
+        mid_end = len(out) - PREVIEW_TAIL
+        return (f"{out[:PREVIEW_HEAD]}\n\n...[output #{oid} is {len(out)} chars; chars {PREVIEW_HEAD}-{mid_end} not shown. "
+                f"Use read_output(id={oid}, offset={PREVIEW_HEAD}) to page through it, or search / read_file with line ranges.]...\n\n"
+                f"{out[mid_end:]}")
+
+
+# Out: every file under base, sorted, skipping hidden folders and SKIP_DIRS (.venv etc.).
+def _walk_files(base: Path) -> list[Path]:
+    files = []
+    for d, dirs, names in os.walk(base):
+        dirs[:] = sorted(x for x in dirs if x not in SKIP_DIRS and not x.startswith("."))  # editing dirs in place prunes the walk
+        files += [Path(d) / n for n in sorted(names)]
+    return files
 
 # In: workspace folder the tools may touch, max seconds per command. Out: registry with all tools.
 def default_tools(root: str | Path = ".", command_timeout_s: float = 30) -> ToolRegistry:
@@ -118,7 +141,7 @@ def default_tools(root: str | Path = ".", command_timeout_s: float = 30) -> Tool
         # full paths from the root, so the model can pass them straight to read_file
         return "\n".join(str(e.relative_to(root)) + ("/" if e.is_dir() else "") for e in entries) or "(empty)"
 
-    def read_file(path: str) -> str:
+    def read_file(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
         f = safe_path(path)
         if not f.is_file():
             raise ToolError(f"'{path}' is not a file")
@@ -127,7 +150,47 @@ def default_tools(root: str | Path = ".", command_timeout_s: float = 30) -> Tool
         except UnicodeDecodeError:
             raise ToolError(f"'{path}' is not a text file")
         session.note_read(str(f.relative_to(root)))
-        return text
+        if start_line is None and end_line is None:
+            return text
+        lines = text.splitlines(keepends=True)
+        a, b = max(1, int(start_line or 1)), min(len(lines), int(end_line or len(lines)))
+        if a > b:
+            raise ToolError(f"{path} has {len(lines)} lines; asked for {a}-{b}")
+        return f"[{path} lines {a}-{b} of {len(lines)}]\n" + "".join(lines[a - 1:b])
+
+    def search(pattern: str, path: str = ".") -> str:
+        base = safe_path(path)
+        try:
+            rx = re.compile(pattern)
+        except re.error:
+            rx = re.compile(re.escape(pattern))  # not a valid regex: search for the literal text
+        hits = []
+        for f in ([base] if base.is_file() else _walk_files(base)):
+            try:
+                text = f.read_text()
+            except (UnicodeDecodeError, OSError):
+                continue
+            for i, line in enumerate(text.splitlines(), 1):
+                if rx.search(line):
+                    hits.append(f"{f.relative_to(root)}:{i}: {line.strip()[:200]}")
+                    if len(hits) >= 50:
+                        break
+            if len(hits) >= 50:
+                hits.append("...[stopped at 50 matches; narrow the pattern or path]")
+                break
+        out = "\n".join(hits) or f"no matches for {pattern!r}"
+        session.note_seen(out)
+        return out
+
+    def read_output(id: int, offset: int = 0) -> str:
+        if not 1 <= int(id) <= len(session.outputs):
+            raise ToolError(f"no output #{id}; ids go from 1 to {len(session.outputs)}")
+        text, offset = session.outputs[int(id) - 1], max(0, int(offset))
+        part = text[offset:offset + PAGE_CHARS]
+        end = offset + len(part)
+        more = f" Next: read_output(id={id}, offset={end})." if end < len(text) else " (end)"
+        session.note_seen(part)
+        return f"[output #{id}, chars {offset}-{end} of {len(text)}.{more}]\n{part}"
 
     # Every file change goes through here: snapshot the original, write, and undo at once if Python no longer parses.
     def change(f: Path, new_text: str) -> None:
@@ -200,9 +263,24 @@ def default_tools(root: str | Path = ".", command_timeout_s: float = 30) -> Tool
          "properties": {"path": {"type": "string", "description": "Directory relative to the project root. Default '.'"}}},
         list_dir))
     reg.add(Tool(
-        "read_file", "Read a text file and return its contents.",
-        {"type": "object", "properties": {"path": path_prop}, "required": ["path"]},
-        read_file))
+        "read_file", "Read a text file. For big files, pass start_line/end_line (1-based, inclusive) to read only part of it.",
+        {"type": "object", "properties": {"path": path_prop,
+                                          "start_line": {"type": "integer", "description": "First line to read (optional)."},
+                                          "end_line": {"type": "integer", "description": "Last line to read (optional)."}},
+         "required": ["path"]},
+        read_file, aliases={"line_start": "start_line", "line_end": "end_line"}))
+    reg.add(Tool(
+        "search", "Search file contents with a regular expression. Returns matching lines as path:line: text (max 50).",
+        {"type": "object", "properties": {"pattern": {"type": "string", "description": "Regex (or plain text) to look for."},
+                                          "path": {"type": "string", "description": "File or folder to search, relative to the project root. Default '.'"}},
+         "required": ["pattern"]},
+        search))
+    reg.add(Tool(
+        "read_output", "Page through a long tool output that was cut (the message says its id and the next offset).",
+        {"type": "object", "properties": {"id": {"type": "integer", "description": "Output id from the cut message."},
+                                          "offset": {"type": "integer", "description": "Character to start from. Default 0."}},
+         "required": ["id"]},
+        read_output))
     reg.add(Tool(
         "write_file", "Create or overwrite a whole file. Prefer edit_file for small changes to existing files.",
         {"type": "object", "properties": {"path": path_prop, "content": {"type": "string", "description": "Full new file contents."}},

@@ -5,6 +5,7 @@ provider = "ollama"
 name = "qwen2.5-coder:7b"
 url = "http://localhost:11434"
 timeout_s = 300
+max_context_tokens = 8192    # also sent to Ollama as num_ctx (its default 4096 silently drops old text)
 
 [models.groq]
 provider = "openai_compat"
@@ -12,6 +13,8 @@ name = "openai/gpt-oss-120b"        # check console.groq.com for current models 
 url = "https://api.groq.com/openai/v1"
 api_key_env = "GROQ_API_KEY"       # name of the env var holding the key; the key never goes in this file
 timeout_s = 60
+max_context_tokens = 8000    # free tier: 8000 tokens/MINUTE, so one request can never be bigger than that
+tokens_per_minute = 8000     # wait before sending if the last minute's tokens + this request would go over (B28)
 
 [agent]
 workspace = "."   # folder the file tools may read
@@ -20,4 +23,7 @@ approval = "ask"  # "ask": prompt before writes/commands; "auto": allow all the 
 command_timeout_s = 30
 test_command = ""     # e.g. "python -m unittest"; if set, finish is only accepted when it passes
 rollback = true       # a run that doesn't finish properly AND fails test_command gets its file changes undone
+reserve_output_tokens = 1500   # context budget = max_context_tokens - this (room for the reply)
+summarize = "model"            # compaction summary: "model" (asks the model) or "mechanical" (no extra call)
+keep_recent_turns = 3          # newest turns kept whole while compacting
 trace_dir = "traces"   # one JSONL file per run; view with: python -m runtime.trace view

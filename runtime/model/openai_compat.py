@@ -1,14 +1,14 @@
 import json, re, time, uuid, httpx
 from runtime.types import Message, Response, ToolCall
-from runtime.model.base import ModelClient, ModelError, ModelUnavailable, ModelTimeout, ModelRateLimited, ModelBadOutput
+from runtime.model.base import ModelClient, ModelError, ModelUnavailable, ModelTimeout, ModelRateLimited, ModelBadOutput, ModelContextOverflow, ModelQuotaExceeded
 from runtime.model.fallback import parse_text_tool_call
 
 # Adapter for any OpenAI-compatible chat API: Groq, OpenRouter, Cerebras, Ollama's /v1, OpenAI itself.
 class OpenAICompatClient(ModelClient):
-    def __init__(self, name: str, url: str, timeout_s: float, api_key: str | None = None):
+    def __init__(self, name: str, url: str, timeout_s: float, api_key: str | None = None, transport=None):
         self.name = name
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        self.http = httpx.Client(base_url=url, timeout=timeout_s, headers=headers)  # headers sent on every request
+        self.http = httpx.Client(base_url=url, timeout=timeout_s, headers=headers, transport=transport)  # transport: tests swap in a fake server  # headers sent on every request
 
     # In: full history + tool schemas. Out: Response. Raises only our ModelErrors.
     def complete(self, messages: list[Message], tools: list[dict] | None = None) -> Response:
@@ -23,9 +23,13 @@ class OpenAICompatClient(ModelClient):
             raise ModelUnavailable(f"API not reachable: {e}") from e
         except httpx.TimeoutException as e:
             raise ModelTimeout(str(e)) from e
+        except httpx.TransportError as e:     # any other network failure (dropped connection, reset, bad response): retryable (B24)
+            raise ModelUnavailable(f"API connection failed: {type(e).__name__}: {e}") from e
         except httpx.HTTPStatusError as e:
             code = e.response.status_code
             text = re.sub(r"org_[A-Za-z0-9]+", "org_***", e.response.text[:500])  # don't copy account ids into traces/results
+            if code == 429 and "per day" in text:  # Groq: tokens/requests per DAY used up (B29)
+                raise ModelQuotaExceeded(f"429 daily limit reached: {text}") from e
             if code == 429:
                 wait = e.response.headers.get("retry-after")  # server's hint, in seconds
                 raise ModelRateLimited(f"429 rate limited: {text}",
@@ -36,6 +40,8 @@ class OpenAICompatClient(ModelClient):
                 except Exception:
                     gen = ""
                 raise ModelBadOutput(f"malformed tool call: {text}", gen) from e
+            if code == 413 or "context_length_exceeded" in text:  # Groq: over tokens-per-minute; OpenAI: over the context window
+                raise ModelContextOverflow(f"{code} request too large: {text}") from e
             if code >= 500:
                 raise ModelUnavailable(f"{code} server error: {text}") from e
             raise ModelError(f"{code}: {text}") from e  # 401 bad key, 400 bad request, 404 unknown model

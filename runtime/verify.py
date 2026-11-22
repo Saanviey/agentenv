@@ -55,7 +55,7 @@ class CodingVerifier(Verifier):
 
 # Out: workspace files named in the answer that the agent never read, changed, or saw in a command's output (B9).
 def unread_mentions(answer: str, session: Session) -> list[str]:
-    seen_text = "\n".join(c.output for c in session.commands)
+    seen_text = "\n".join([c.output for c in session.commands] + session.seen)
     touched = session.read | set(session.snapshots)
     out = []
     for name in sorted(set(FILE_RE.findall(answer))):

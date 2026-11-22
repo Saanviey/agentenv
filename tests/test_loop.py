@@ -104,6 +104,10 @@ class FinishAliases(unittest.TestCase):
         r, _ = run([call("final", {"text": "x"}), call("finish", {"answer": "ok"})])
         self.assertEqual(r.steps, 2)
 
+    def test_structured_alias_with_nested_finish(self):  # B27
+        r, _ = run([call("json", {"name": "finish", "arguments": {"answer": "nested"}})])
+        self.assertEqual((r.stopped, r.answer), ("finish", "nested"))
+
     def test_broken_json_is_not_salvaged(self):
         r, _ = run([ModelBadOutput("400", '{"name": "answer", "arguments": All tests pass."}'), call("finish", {"answer": "ok"})])
         self.assertEqual(r.steps, 2)

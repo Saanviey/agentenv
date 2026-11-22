@@ -5,9 +5,9 @@ from runtime.model.fallback import parse_text_tool_call
 
 # Adapter: our Messages -> Ollama /api/chat -> our Response.
 class OllamaClient(ModelClient):
-    def __init__(self, name: str, url: str, timeout_s: float):
-        self.name = name
-        self.http = httpx.Client(base_url=url, timeout=timeout_s)  # reusable connection; paths join onto base_url
+    def __init__(self, name: str, url: str, timeout_s: float, num_ctx: int | None = None, transport=None):
+        self.name, self.num_ctx = name, num_ctx
+        self.http = httpx.Client(base_url=url, timeout=timeout_s, transport=transport)  # transport: tests swap in a fake server  # reusable connection; paths join onto base_url
 
     # In: full history + tool schemas. Out: Response. Raises only our ModelErrors.
     def complete(self, messages: list[Message], tools: list[dict] | None = None) -> Response:
@@ -18,6 +18,8 @@ class OllamaClient(ModelClient):
         }
         if tools:
             body["tools"] = tools  # Ollama pastes these into the prompt via the model's template
+        if self.num_ctx:
+            body["options"] = {"num_ctx": self.num_ctx}  # context window; Ollama's default (4096) silently drops the oldest text
         start = time.perf_counter()
         try:
             r = self.http.post("/api/chat", json=body)  # json= serializes body and sets the header
@@ -26,6 +28,8 @@ class OllamaClient(ModelClient):
             raise ModelUnavailable(f"Ollama not reachable: {e}") from e
         except httpx.TimeoutException as e:   # exceeded timeout_s
             raise ModelTimeout(str(e)) from e
+        except httpx.TransportError as e:     # any other network failure (dropped connection, reset, bad response): retryable (B24)
+            raise ModelUnavailable(f"Ollama connection failed: {type(e).__name__}: {e}") from e
         except httpx.HTTPStatusError as e:    # server replied with an error, e.g. 404
             raise ModelError(f"{e.response.status_code}: {e.response.text}") from e
 

@@ -75,7 +75,8 @@ def render(events: list[dict], full: bool = False) -> str:
                     f"approval={e.get('approval')}  max_steps={e.get('max_steps')}",
                     f"     tools: {', '.join(e.get('tools', []))}"]
         elif k == "model_request":
-            out.append(f"\n── step {e['step']}  (+{len(e['new_messages'])} new messages, {e['total_messages']} total)")
+            est = f", ~{e['est_tokens']} tokens" if e.get("est_tokens") else ""
+            out.append(f"\n── step {e['step']}  (+{len(e['new_messages'])} new messages, {e['total_messages']} total{est})")
             if full:
                 for m in e["new_messages"]:
                     out.append(f"     > [{m['role']}] {_short(m['content'], n)}")
@@ -90,6 +91,13 @@ def render(events: list[dict], full: bool = False) -> str:
             out.append(f"   MODEL ERROR {e['type']}: {_short(e['error'], n)}")
             if e.get("generation"):
                 out.append(f"     model wrote: {_short(e['generation'], n)}")
+        elif k == "compaction":
+            out.append(f"   ✂ context {e['before']} → {e['after']} tokens (budget {e['budget']}): {e['method']}; "
+                       f"{e['elided']} results elided, {e['summarized']} messages summarized")
+            if e.get("summary"):
+                out.append(f"     summary: {_short(e['summary'], n)}")
+        elif k == "throttle":
+            out.append(f"   ⏳ throttle: {e['used']} tokens used in the last minute, need {e['need']}; waited {e['wait_s']}s")
         elif k == "retry":
             out.append(f"   retry {e['attempt']}: {e['error_type']} ({_short(e['error'], 120)}), waiting {e['delay_s']}s")
         elif k == "reminder":

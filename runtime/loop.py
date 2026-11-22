@@ -1,7 +1,8 @@
 import json, logging
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from runtime.types import Message
-from runtime.model.base import ModelClient, ModelBadOutput
+from runtime.model.base import ModelClient, ModelBadOutput, ModelContextOverflow
+from runtime.context import ContextManager, estimate_tokens
 from runtime.tools import ToolRegistry, FINISH, parse_args
 from runtime import policy
 from runtime.policy import Approver, deny_all
@@ -13,6 +14,8 @@ log = logging.getLogger("runtime.loop")
 
 SYSTEM_PROMPT = """You are a coding assistant working inside the user's project folder.
 Use the provided tools to act. Paths are relative to the project root.
+Files and outputs can be big: use search to find things, read_file with start_line/end_line for parts of a file.
+Long tool outputs are cut; read_output pages through them. Old results may be shortened later to save space.
 Never describe a file you have not read with read_file.
 To change code: read the file, change it with edit_file (exact old text -> new text), then run the tests with run_command to check.
 If you changed files, the tests must pass after your last change before you call finish. revert_file undoes your changes to a file.
@@ -43,10 +46,11 @@ class RunResult:
 # Repeats: call model -> run the tools it asked for -> append results, until it calls finish.
 def run_agent(client: ModelClient, tools: ToolRegistry, messages: list[Message],
               max_steps: int = 10, max_reminders: int = 2, approve: Approver = deny_all,
-              trace: Tracer = NULL, verifier: Verifier = Verifier(), rollback: bool = True) -> RunResult:
+              trace: Tracer = NULL, verifier: Verifier = Verifier(), rollback: bool = True,
+              context: ContextManager | None = None) -> RunResult:
     progress = {"steps": 0, "input_tokens": 0, "output_tokens": 0}  # updated each step, so a crash still reports how far it got
     try:
-        result = _run(client, tools, list(messages), max_steps, max_reminders, approve, trace, progress, verifier)  # copy; don't mutate the caller's list
+        result = _run(client, tools, list(messages), max_steps, max_reminders, approve, trace, progress, verifier, context)  # copy; don't mutate the caller's list
     except Exception as e:
         trace.event("run_error", type=type(e).__name__, error=str(e), **progress)
         if rollback:
@@ -59,7 +63,7 @@ def run_agent(client: ModelClient, tools: ToolRegistry, messages: list[Message],
                 input_tokens=result.input_tokens, output_tokens=result.output_tokens)
     return result
 
-def _run(client, tools, messages, max_steps, max_reminders, approve, trace, progress, verifier) -> RunResult:
+def _run(client, tools, messages, max_steps, max_reminders, approve, trace, progress, verifier, context) -> RunResult:
     sent = 0  # how many messages the model has already seen, so the trace stores only new ones
     in_tok = out_tok = reminders = rejections = 0
 
@@ -81,10 +85,13 @@ def _run(client, tools, messages, max_steps, max_reminders, approve, trace, prog
 
     for step in range(1, max_steps + 1):
         progress.update(steps=step, input_tokens=in_tok, output_tokens=out_tok)
-        trace.event("model_request", step=step, new_messages=messages[sent:], total_messages=len(messages))
+        schemas = tools.schemas()
+        sent = _compact(context, messages, schemas, sent, trace, step, facts=_facts(tools))
+        trace.event("model_request", step=step, new_messages=messages[sent:], total_messages=len(messages),
+                    est_tokens=context.estimate(messages, schemas) if context else estimate_tokens(messages, schemas))
         sent = len(messages)
         try:
-            resp = client.complete(messages, tools.schemas())
+            resp, raw_est = _complete(client, messages, schemas, context, trace, step, _facts(tools))
         except ModelBadOutput as e:  # model's mistake, not the server's: show it and let it try again
             trace.event("model_error", step=step, type="ModelBadOutput", error=str(e), generation=e.generation)
             if (answer := _salvage_finish(e.generation, set(tools.names()))) is not None:
@@ -105,6 +112,8 @@ def _run(client, tools, messages, max_steps, max_reminders, approve, trace, prog
             raise
         in_tok += resp.input_tokens
         out_tok += resp.output_tokens
+        if context:
+            context.observe(raw_est, resp.input_tokens)
         messages.append(resp.message)
         trace.event("model_response", step=step, message=resp.message, stop_reason=resp.stop_reason,
                     input_tokens=resp.input_tokens, output_tokens=resp.output_tokens,
@@ -131,9 +140,10 @@ def _run(client, tools, messages, max_steps, max_reminders, approve, trace, prog
         for call in resp.message.tool_calls:
             t0 = time.perf_counter()
             decision, reason, approved, repeat = "allow", "", True, False
-            if call.name == FINISH or (tools.get(call.name) is None and _answer_in(call.arguments, set(tools.names()))):
-                answer = call.arguments.get("answer") if isinstance(call.arguments, dict) else None
-                if isinstance(answer, str) and answer.strip():
+            known = set(tools.names())
+            if call.name == FINISH or (tools.get(call.name) is None and _answer_in(call.arguments, known)):
+                answer = _answer_in(call.arguments, known)  # same rule as the check above, so nested answers are found too (B27)
+                if answer:
                     r = try_finish(answer, step, "finish" if call.name == FINISH else "alias")
                     if isinstance(r, RunResult):
                         return r
@@ -155,6 +165,36 @@ def _run(client, tools, messages, max_steps, max_reminders, approve, trace, prog
 
     log.warning("hit max_steps=%d without finish", max_steps)
     return RunResult("(stopped: step limit reached)", messages, max_steps, in_tok, out_tok, "max_steps")
+
+# Before each model call: shrink the conversation if it's over budget. Out: the new `sent` index for the trace.
+# Compaction never touches the last turn, which holds every message added since the last call.
+def _compact(context, messages, schemas, sent, trace, step, budget=None, facts: str = "") -> int:
+    if context is None:
+        return sent
+    n_new = len(messages) - sent
+    c = context.fit(messages, schemas, budget, facts=facts)
+    if c is None:
+        return sent
+    trace.event("compaction", step=step, **asdict(c))
+    log.info("  context %d -> %d tokens (budget %d): %s", c.before, c.after, c.budget, c.method)
+    return len(messages) - n_new
+
+def _facts(tools: ToolRegistry) -> str:
+    return tools.session.facts() if tools.session else ""
+
+# One model call. On "request too large" (HTTP 413), learn a smaller budget, compact, and try once more.
+# Out: (response, raw token estimate of what was sent), for calibration.
+def _complete(client, messages, schemas, context, trace, step, facts: str = ""):
+    try:
+        return client.complete(messages, schemas), estimate_tokens(messages, schemas)
+    except ModelContextOverflow as e:
+        if context is None:
+            raise
+        trace.event("model_error", step=step, type="ModelContextOverflow", error=str(e), generation="")
+        context.budget = max(500, int(context.estimate(messages, schemas) * 0.8))  # the server's limit is lower than we thought
+        log.warning("  request too large; budget lowered to %d, compacting", context.budget)
+        _compact(context, messages, schemas, len(messages), trace, step, facts=facts)
+        return client.complete(messages, schemas), estimate_tokens(messages, schemas)
 
 # A run that didn't finish properly: undo its file changes if the verifier says they're broken.
 def _rollback_if_broken(tools: ToolRegistry, verifier: Verifier, trace: Tracer) -> None:

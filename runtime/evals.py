@@ -10,6 +10,7 @@ from runtime.tools import default_tools
 from runtime.trace import Tracer, NULL
 from runtime.types import Message
 from runtime.verify import CodingVerifier
+from runtime.context import ContextManager, from_config as context_from_config
 
 TASKS_DIR = Path("evals/tasks")
 RESULTS_DIR = Path("evals/results")
@@ -57,7 +58,8 @@ def _check(ws: Path) -> subprocess.CompletedProcess:
     return subprocess.run(CHECK, cwd=ws, capture_output=True, text=True, timeout=120)
 
 # In: a task + a model client. Out: TaskResult. Runs the agent on a fresh copy of the repo, then checks it.
-def run_task(task: Task, client: ModelClient, trace: Tracer = NULL, command_timeout_s: float = 30) -> TaskResult:
+def run_task(task: Task, client: ModelClient, trace: Tracer = NULL, command_timeout_s: float = 30,
+             context: ContextManager | None = None) -> TaskResult:
     with tempfile.TemporaryDirectory() as tmp:
         ws = Path(tmp) / "repo"
         shutil.copytree(task.repo, ws)
@@ -69,7 +71,7 @@ def run_task(task: Task, client: ModelClient, trace: Tracer = NULL, command_time
         try:
             r = run_agent(client, tools, [Message("system", SYSTEM_PROMPT), Message("user", task.prompt)],
                           task.max_steps, approve=approve_all, trace=trace,
-                          verifier=CodingVerifier(shlex.join(CHECK)), rollback=True)
+                          verifier=CodingVerifier(shlex.join(CHECK)), rollback=True, context=context)
             stopped, steps, tin, tout = r.stopped, r.steps, r.input_tokens, r.output_tokens
         except ModelError as e:
             error = f"{type(e).__name__}: {e}"
@@ -133,6 +135,7 @@ def main():
     ap.add_argument("--model", help="model profile from config.toml (default: config's `model`)")
     ap.add_argument("--tasks", help="comma-separated task names (default: all)")
     ap.add_argument("--pause", type=float, default=0, help="seconds to wait between tasks (rate limits)")
+    ap.add_argument("--max-context", type=int, help="override the model profile's max_context_tokens (experiments)")
     a = ap.parse_args()
     import logging
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
@@ -155,21 +158,29 @@ def main():
         m = model_config(cfg)
     except ConfigError as e:
         sys.exit(f"config: {e}")
+    if a.max_context:
+        m["max_context_tokens"] = a.max_context
     current = {"trace": NULL}  # retries are written to whichever task's trace is active
     client = build_client(m, on_retry=lambda attempt, delay, e: current["trace"].event(
-        "retry", attempt=attempt, delay_s=delay, error_type=type(e).__name__, error=str(e)[:300]))
+        "retry", attempt=attempt, delay_s=delay, error_type=type(e).__name__, error=str(e)[:300]),
+        on_throttle=lambda wait, used, need: current["trace"].event("throttle", wait_s=round(wait, 1), used=used, need=need))
     run_id = f"{datetime.now():%Y%m%d-%H%M%S}-{cfg['model']}"
     trace_dir = Path(cfg.get("agent", {}).get("trace_dir", "traces")) / "evals" / run_id
     print(f"eval {run_id}: {len(tasks)} tasks, model {m['name']} via {m['provider']}")
 
-    results = []
+    results, aborted = [], ""
     for i, t in enumerate(tasks):
         if i and a.pause:
             time.sleep(a.pause)
         tr = current["trace"] = Tracer(trace_dir / f"{t.name}.jsonl")
-        r = run_task(t, client, tr, cfg.get("agent", {}).get("command_timeout_s", 30))
+        agent_cfg = cfg.get("agent", {})
+        r = run_task(t, client, tr, agent_cfg.get("command_timeout_s", 30), context_from_config(m, agent_cfg, client))  # fresh per task
         tr.close()
         results.append(r)
+        if r.error.startswith("ModelQuotaExceeded"):  # B29: the rest would fail the same way; stop and keep what we have
+            print(f"  STOPPED: the provider's daily limit is used up. {len(tasks) - i - 1} task(s) not run; partial results saved.")
+            aborted = f"daily limit reached after {i + 1} of {len(tasks)} tasks"
+            break
         print(f"  {t.name:22} {('PASS' if r.finished else 'PASS*') if r.passed else 'FAIL'}  {r.stopped:10} {r.steps:2} steps  {r.seconds:5.1f}s"
               + ("  TAMPERED" if r.tampered else "") + (f"  {r.error[:60]}" if r.error else ""))
 
@@ -178,7 +189,7 @@ def main():
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out = RESULTS_DIR / f"{run_id}.json"
     out.write_text(json.dumps({"run_id": run_id, "model": m["name"], "provider": m["provider"],
-                               "summary": summary, "results": [asdict(r) for r in results]}, indent=2))
+                               "summary": summary, "aborted": aborted, "results": [asdict(r) for r in results]}, indent=2))
     print(f"PASS* = tests pass but the agent didn't finish cleanly (crashed / ran out of steps)\nresults: {out}\ntraces:  {trace_dir}/")
 
 if __name__ == "__main__":

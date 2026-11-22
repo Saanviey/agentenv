@@ -17,6 +17,8 @@ class Session:
     read: set[str] = field(default_factory=set)                     # relative paths read
     snapshots: dict[str, str | None] = field(default_factory=dict)  # path -> content at FIRST change (None = file didn't exist)
     commands: list[CommandRun] = field(default_factory=list)
+    outputs: list[str] = field(default_factory=list)                # full text of big tool results (offloaded); id = index + 1
+    seen: list[str] = field(default_factory=list)                   # other tool output the agent saw (search results)
     last_change: int = 0     # order of the most recent file change
     _clock: int = 0
 
@@ -34,6 +36,27 @@ class Session:
 
     def note_command(self, command: str, exit_code: int | None, output: str) -> None:
         self.commands.append(CommandRun(command, exit_code, output, self._tick()))
+
+    # Keeps a big tool result out of the conversation. Out: its id, for read_output.
+    def store_output(self, text: str) -> int:
+        self.outputs.append(text)
+        return len(self.outputs)
+
+    def note_seen(self, text: str) -> None:
+        self.seen.append(text)
+
+    # Out: what the tools recorded, as plain text. Written by the runtime, so it can't be hallucinated (used under summaries).
+    def facts(self) -> str:
+        lines = []
+        if self.read:
+            lines.append("- files read: " + ", ".join(sorted(self.read)))
+        if self.snapshots:
+            lines.append("- files changed: " + (", ".join(self.changed()) or "none (changes were undone)"))
+        if self.commands:
+            c = self.commands[-1]
+            result = "timed out" if c.exit_code is None else f"exit code {c.exit_code}"
+            lines.append(f"- last command: `{c.command}` -> {result} ({len(self.commands)} commands so far)")
+        return "\n".join(lines)
 
     # Out: files whose content now differs from the start of the run.
     def changed(self) -> list[str]:

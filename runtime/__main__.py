@@ -9,6 +9,7 @@ from runtime.loop import run_agent, SYSTEM_PROMPT
 from runtime.policy import ask_user, approve_all
 from runtime.trace import new_trace
 from runtime.verify import CodingVerifier
+from runtime.context import from_config as context_from_config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")  # logs to stderr
 logging.getLogger("httpx").setLevel(logging.WARNING)  # hide httpx's per-request lines; the loop logs each step
@@ -28,7 +29,8 @@ def main():
     try:
         m = model_config(cfg)
         client = build_client(m, on_retry=lambda attempt, delay, e: trace.event(
-            "retry", attempt=attempt, delay_s=delay, error_type=type(e).__name__, error=str(e)))
+            "retry", attempt=attempt, delay_s=delay, error_type=type(e).__name__, error=str(e)),
+            on_throttle=lambda wait, used, need: trace.event("throttle", wait_s=round(wait, 1), used=used, need=need))
     except ConfigError as e:
         log.error("config: %s", e)
         sys.exit(2)
@@ -49,7 +51,7 @@ def main():
     try:
         verifier = CodingVerifier(a.get("test_command") or None, a.get("command_timeout_s", 30) * 4)
         result = run_agent(client, tools, messages, a.get("max_steps", 10), approve=approve, trace=trace,
-                           verifier=verifier, rollback=a.get("rollback", True))
+                           verifier=verifier, rollback=a.get("rollback", True), context=context_from_config(m, a, client))
     except ModelError as e:
         log.error("model call failed: %s", e)
         log.info("trace: %s", trace.path)
