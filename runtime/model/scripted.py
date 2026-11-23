@@ -8,6 +8,6 @@ class ScriptedClient(ModelClient):
     def complete(self, messages, tools=None):
         self.calls.append(list(messages))
         item = self.script.pop(0)
-        if isinstance(item, Exception):
+        if isinstance(item, BaseException):  # BaseException: also KeyboardInterrupt (Ctrl-C), which isn't an Exception
             raise item
         return item

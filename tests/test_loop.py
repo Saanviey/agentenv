@@ -11,8 +11,8 @@ def run(script, **kw):
     client = FakeClient(script)
     return run_agent(client, default_tools("."), START, **kw), client
 
-def tool_results(result):
-    return [m.content for m in result.messages if m.role == "tool"]
+def tool_results(result):  # results of real tools (an accepted finish also gets a "finish accepted" result, B30)
+    return [m.content for m in result.messages if m.role == "tool" and m.tool_name != "finish"]
 
 # S2 done-when: bad JSON / unknown tool / wrong args never crash the run.
 class NeverCrash(unittest.TestCase):
@@ -43,7 +43,7 @@ class NeverCrash(unittest.TestCase):
 
     def test_finish_without_answer(self):
         r, _ = run([call("finish", {}), call("finish", {"answer": "ok"})])
-        self.assertIn("finish needs", tool_results(r)[0])
+        self.assertIn("finish needs", [m.content for m in r.messages if m.role == "tool"][0])
         self.assertEqual(r.answer, "ok")
 
 class Stopping(unittest.TestCase):

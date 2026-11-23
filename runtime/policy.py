@@ -40,6 +40,8 @@ def check(tool: Tool, args: dict) -> Decision:
             if re.search(pattern, cmd):
                 return Decision("deny", f"{why}: {cmd!r}")
         return Decision("ask", f"run: {cmd}")
+    if tool.risk == "memory":  # model-written notes shape every future run in this folder (B25 lesson): a human decides
+        return Decision("ask", f"save to project memory: {args.get('fact')}")
     return Decision("deny", f"unknown risk level {tool.risk!r}")
 
 # An approver: In: tool name, args, reason. Out: True to allow.

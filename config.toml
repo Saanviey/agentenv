@@ -16,6 +16,15 @@ timeout_s = 60
 max_context_tokens = 8000    # free tier: 8000 tokens/MINUTE, so one request can never be bigger than that
 tokens_per_minute = 8000     # wait before sending if the last minute's tokens + this request would go over (B28)
 
+[models.groq-small]                  # same API, smaller model, its OWN daily limit on Groq
+provider = "openai_compat"
+name = "openai/gpt-oss-20b"
+url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+timeout_s = 60
+max_context_tokens = 8000
+tokens_per_minute = 8000
+
 [agent]
 workspace = "."   # folder the file tools may read
 max_steps = 10    # model calls per run before giving up
@@ -26,4 +35,5 @@ rollback = true       # a run that doesn't finish properly AND fails test_comman
 reserve_output_tokens = 1500   # context budget = max_context_tokens - this (room for the reply)
 summarize = "model"            # compaction summary: "model" (asks the model) or "mechanical" (no extra call)
 keep_recent_turns = 3          # newest turns kept whole while compacting
+state_dir = "state"            # S8: agent.db (runs + checkpoints) and memory/ (project memory files)
 trace_dir = "traces"   # one JSONL file per run; view with: python -m runtime.trace view

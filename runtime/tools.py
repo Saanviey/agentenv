@@ -20,7 +20,7 @@ def safe_env() -> dict[str, str]:
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
 
-Risk = Literal["read", "write", "exec"]  # read = no side effects; write = changes files; exec = runs a program
+Risk = Literal["read", "write", "exec", "memory"]  # read = no side effects; write = changes files; exec = runs a program; memory = saves a note for future runs
 
 
 class ToolError(Exception): ...  # expected failure; its message is shown to the model
@@ -121,7 +121,8 @@ def _walk_files(base: Path) -> list[Path]:
     return files
 
 # In: workspace folder the tools may touch, max seconds per command. Out: registry with all tools.
-def default_tools(root: str | Path = ".", command_timeout_s: float = 30) -> ToolRegistry:
+# memory_file: project memory file (S8); None = no `remember` tool.
+def default_tools(root: str | Path = ".", command_timeout_s: float = 30, memory_file: Path | None = None) -> ToolRegistry:
     root = Path(root).resolve()
     session = Session(root)
 
@@ -302,6 +303,18 @@ def default_tools(root: str | Path = ".", command_timeout_s: float = 30) -> Tool
         {"type": "object", "properties": {"command": {"type": "string", "description": "Shell command to run."}},
          "required": ["command"]},
         run_command, risk="exec"))
+    if memory_file:
+        def remember(fact: str) -> str:
+            from runtime.memory import add_fact
+            try:
+                return add_fact(memory_file, fact)
+            except ValueError as e:
+                raise ToolError(str(e))
+        reg.add(Tool(
+            "remember", "Save one short fact about this project for future runs (e.g. how to run the tests, where the main "
+                        "code is, a gotcha you hit). Only facts you checked yourself. Not for task progress.",
+            {"type": "object", "properties": {"fact": {"type": "string", "description": "One sentence."}}, "required": ["fact"]},
+            remember, risk="memory"))
     reg.add(Tool(
         "get_time", "Get the current local date and time.",
         {"type": "object", "properties": {}},

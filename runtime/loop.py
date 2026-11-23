@@ -1,5 +1,6 @@
 import json, logging
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
+from typing import Callable
 from runtime.types import Message
 from runtime.model.base import ModelClient, ModelBadOutput, ModelContextOverflow
 from runtime.context import ContextManager, estimate_tokens
@@ -30,6 +31,8 @@ BAD_CALL = ("Your last reply was rejected and nothing was run. Reason: {why}\nYo
 CUT_OFF = "Your reply was cut off because it was too long. Call a tool, or call finish with a shorter answer."
 MAX_REJECTIONS = 2  # finish rejected this many times -> accept the answer but mark the run 'unverified'
 _decoder = json.JSONDecoder()
+INTERRUPTED = ("error: the runtime was stopped while running {name}, so it may or may not have happened. "
+               "Check the current state (read the file / run the tests) before doing it again.")
 REPEAT_NOTE = "\n\nnote: you already made this exact call {n} time(s) before; the result has not changed. Use it and move on."
 
 # Outcome of one agent run.
@@ -42,79 +45,156 @@ class RunResult:
     output_tokens: int
     stopped: str              # "finish" | "unverified" | "no_finish" | "max_steps"
 
-# In: client, tools, starting messages, limits. Out: RunResult. Raises: ModelError.
+# Everything the loop changes while it runs. Saved after every action (S8), so a killed run can continue.
+@dataclass
+class RunState:
+    messages: list[Message]
+    step: int = 0                  # last step started
+    in_tok: int = 0
+    out_tok: int = 0
+    reminders: int = 0             # plain-text / bad replies in a row
+    rejections: int = 0            # finish attempts the verifier rejected
+    seen: dict[str, int] = field(default_factory=dict)  # call signature -> times called (B13)
+    sent: int = 0                  # messages already written to the trace
+    pending: int | None = None     # index of a tool call (in the last assistant message) that started but didn't finish
+
+# A checkpoint function: In: the state + a status ("running", "interrupted", "crashed", or how the run ended).
+Checkpoint = Callable[[RunState, str], None]
+
+# In: client, tools, starting messages, limits. Out: RunResult. Raises: ModelError (and KeyboardInterrupt on Ctrl-C).
 # Repeats: call model -> run the tools it asked for -> append results, until it calls finish.
+# state: continue a saved run instead of starting from `messages` (S8 resume). checkpoint: called after every action.
 def run_agent(client: ModelClient, tools: ToolRegistry, messages: list[Message],
               max_steps: int = 10, max_reminders: int = 2, approve: Approver = deny_all,
               trace: Tracer = NULL, verifier: Verifier = Verifier(), rollback: bool = True,
-              context: ContextManager | None = None) -> RunResult:
-    progress = {"steps": 0, "input_tokens": 0, "output_tokens": 0}  # updated each step, so a crash still reports how far it got
+              context: ContextManager | None = None, checkpoint: Checkpoint | None = None,
+              state: RunState | None = None) -> RunResult:
+    st = state or RunState(list(messages))  # copy; don't mutate the caller's list
     try:
-        result = _run(client, tools, list(messages), max_steps, max_reminders, approve, trace, progress, verifier, context)  # copy; don't mutate the caller's list
+        result = _run(client, tools, st, max_steps, max_reminders, approve, trace, verifier, context, checkpoint)
+    except KeyboardInterrupt:  # Ctrl-C: not an Exception subclass, so handled on its own. Keep changes; it can be resumed.
+        trace.event("run_interrupted", step=st.step)
+        if checkpoint:
+            checkpoint(st, "interrupted")
+        raise
     except Exception as e:
-        trace.event("run_error", type=type(e).__name__, error=str(e), **progress)
-        if rollback:
+        trace.event("run_error", type=type(e).__name__, error=str(e), **_progress(st))
+        if checkpoint:
+            checkpoint(st, "crashed")  # resumable: don't roll back work a resume could continue
+        elif rollback:
             _rollback_if_broken(tools, verifier, trace)
-        e.progress = progress
+        e.progress = _progress(st)
         raise
     if rollback and result.stopped != "finish":
         _rollback_if_broken(tools, verifier, trace)
+    if checkpoint:
+        checkpoint(st, result.stopped)
     trace.event("run_end", stopped=result.stopped, steps=result.steps, answer=result.answer,
                 input_tokens=result.input_tokens, output_tokens=result.output_tokens)
     return result
 
-def _run(client, tools, messages, max_steps, max_reminders, approve, trace, progress, verifier, context) -> RunResult:
-    sent = 0  # how many messages the model has already seen, so the trace stores only new ones
-    in_tok = out_tok = reminders = rejections = 0
+def _progress(st: RunState) -> dict:
+    return {"steps": st.step, "input_tokens": st.in_tok, "output_tokens": st.out_tok}
+
+def _run(client, tools, st: RunState, max_steps, max_reminders, approve, trace, verifier, context, checkpoint) -> RunResult:
+    messages = st.messages
+
+    def save():
+        if checkpoint:
+            checkpoint(st, "running")
+
+    def result(answer: str, stopped: str) -> RunResult:
+        return RunResult(answer, messages, st.step, st.in_tok, st.out_tok, stopped)
 
     # Every way the model can say "done" comes through here. Out: RunResult if accepted, else the reason it was rejected.
-    def try_finish(answer: str, step: int, source: str) -> RunResult | str:
-        nonlocal rejections
+    def try_finish(answer: str, source: str) -> RunResult | str:
         reason = verifier.check_finish(answer, tools.session)
         if reason is None:
             if source != "finish":
-                trace.event("finish_salvaged", step=step, source=source, answer=answer)
-            return RunResult(answer, messages, step, in_tok, out_tok, "finish")
-        rejections += 1
-        trace.event("finish_rejected", step=step, source=source, reason=reason, rejections=rejections)
-        log.info("  finish rejected (%d/%d): %s", rejections, MAX_REJECTIONS, _preview(reason, 100))
-        if rejections > MAX_REJECTIONS:  # keep the answer, but say it was never verified
-            return RunResult(answer, messages, step, in_tok, out_tok, "unverified")
+                trace.event("finish_salvaged", step=st.step, source=source, answer=answer)
+            return result(answer, "finish")
+        st.rejections += 1
+        trace.event("finish_rejected", step=st.step, source=source, reason=reason, rejections=st.rejections)
+        log.info("  finish rejected (%d/%d): %s", st.rejections, MAX_REJECTIONS, _preview(reason, 100))
+        if st.rejections > MAX_REJECTIONS:  # keep the answer, but say it was never verified
+            return result(answer, "unverified")
         return f"finish rejected: {reason}"
-    seen: dict[str, int] = {}  # call signature -> times called, to spot repeats (B13)
 
-    for step in range(1, max_steps + 1):
-        progress.update(steps=step, input_tokens=in_tok, output_tokens=out_tok)
+    # Runs the tool calls of one assistant message, from index `start`. Out: RunResult if a finish was accepted, else None.
+    def run_tools(msg: Message, start: int = 0) -> RunResult | None:
+        known = set(tools.names())
+        for idx in range(start, len(msg.tool_calls)):
+            call = msg.tool_calls[idx]
+            t0 = time.perf_counter()
+            decision, reason, approved, repeat = "allow", "", True, False
+            if call.name == FINISH or (tools.get(call.name) is None and _answer_in(call.arguments, known)):
+                answer = _answer_in(call.arguments, known)  # same rule as the check above, so nested answers are found too (B27)
+                if answer:
+                    r = try_finish(answer, "finish" if call.name == FINISH else "alias")
+                    if isinstance(r, RunResult):  # close the call with a result, so the saved conversation stays well-formed (B30)
+                        messages.append(Message("tool", "finish accepted", tool_call_id=call.id, tool_name=call.name))
+                        return r
+                    out = f"error: {r}"
+                else:
+                    out = "error: finish needs a non-empty 'answer'"
+            else:
+                st.pending = idx
+                save()  # write-ahead: if we die during this tool, resume knows it may have half-happened (S8)
+                decision, reason, approved, blocked = _gate(call, tools, approve)
+                out = blocked or tools.run(call.name, call.arguments)
+                key = _signature(call.name, call.arguments)
+                if st.seen.get(key):
+                    repeat = True
+                    out += REPEAT_NOTE.format(n=st.seen[key])
+                st.seen[key] = st.seen.get(key, 0) + 1
+            trace.event("tool", step=st.step, name=call.name, args=call.arguments, decision=decision, reason=reason,
+                        approved=approved, result=out, ms=round((time.perf_counter() - t0) * 1000), repeat=repeat)
+            log.info("  tool %s(%s) -> %s", call.name, call.arguments, _preview(out))
+            messages.append(Message("tool", out, tool_call_id=call.id, tool_name=call.name))
+            st.pending = None
+            save()
+        return None
+
+    # Resuming in the middle of a step: finish the tool calls that have no result yet (S8).
+    if (r := _resume_tools(st, tools, trace, run_tools)) is not None:
+        return r
+
+    while st.step < max_steps:
+        st.step += 1
+        step = st.step
         schemas = tools.schemas()
-        sent = _compact(context, messages, schemas, sent, trace, step, facts=_facts(tools))
-        trace.event("model_request", step=step, new_messages=messages[sent:], total_messages=len(messages),
+        st.sent = _compact(context, messages, schemas, st.sent, trace, step, facts=_facts(tools))
+        trace.event("model_request", step=step, new_messages=messages[st.sent:], total_messages=len(messages),
                     est_tokens=context.estimate(messages, schemas) if context else estimate_tokens(messages, schemas))
-        sent = len(messages)
+        st.sent = len(messages)
         try:
             resp, raw_est = _complete(client, messages, schemas, context, trace, step, _facts(tools))
         except ModelBadOutput as e:  # model's mistake, not the server's: show it and let it try again
             trace.event("model_error", step=step, type="ModelBadOutput", error=str(e), generation=e.generation)
             if (answer := _salvage_finish(e.generation, set(tools.names()))) is not None:
-                if isinstance(r := try_finish(answer, step, "bad_call"), RunResult):
+                if isinstance(r := try_finish(answer, "bad_call"), RunResult):
                     return r
                 messages.append(Message("user", r))
+                save()
                 continue
-            reminders += 1
-            log.info("  malformed tool call (%d/%d): %s", reminders, max_reminders, _preview(e.generation or str(e)))
-            if reminders > max_reminders:
+            st.reminders += 1
+            log.info("  malformed tool call (%d/%d): %s", st.reminders, max_reminders, _preview(e.generation or str(e)))
+            if st.reminders > max_reminders:
                 raise
             messages.append(Message("user", BAD_CALL.format(why=_reason(str(e)), gen=e.generation[:500] or "(not shown)",
                                                             tools=", ".join(tools.names()))))
             trace.event("reminder", step=step, kind="bad_call")
+            save()
             continue
         except Exception as e:
             trace.event("model_error", step=step, type=type(e).__name__, error=str(e), generation="")
             raise
-        in_tok += resp.input_tokens
-        out_tok += resp.output_tokens
+        st.in_tok += resp.input_tokens
+        st.out_tok += resp.output_tokens
         if context:
             context.observe(raw_est, resp.input_tokens)
         messages.append(resp.message)
+        save()  # the reply is saved before any tool runs, so a resume never has to ask the model again for this step
         trace.event("model_response", step=step, message=resp.message, stop_reason=resp.stop_reason,
                     input_tokens=resp.input_tokens, output_tokens=resp.output_tokens,
                     latency_ms=round(resp.latency_ms), model=resp.model, raw=resp.raw)
@@ -123,48 +203,50 @@ def _run(client, tools, messages, max_steps, max_reminders, approve, trace, prog
 
         if not resp.message.tool_calls:  # plain text: not an answer, not an action
             if (answer := _salvage_finish(resp.message.content, set(tools.names()))) is not None:
-                if isinstance(r := try_finish(answer, step, "plain_text"), RunResult):
+                if isinstance(r := try_finish(answer, "plain_text"), RunResult):
                     return r
                 messages.append(Message("user", r))
+                save()
                 continue
-            reminders += 1
-            log.info("  no tool call (%d/%d): %s", reminders, max_reminders, _preview(resp.message.content))
-            if reminders > max_reminders:  # model can't follow the format; take its text rather than burn steps
-                return RunResult(resp.message.content, messages, step, in_tok, out_tok, "no_finish")
+            st.reminders += 1
+            log.info("  no tool call (%d/%d): %s", st.reminders, max_reminders, _preview(resp.message.content))
+            if st.reminders > max_reminders:  # model can't follow the format; take its text rather than burn steps
+                return result(resp.message.content, "no_finish")
             kind = "cut_off" if resp.stop_reason == "length" else "plain_text"
             messages.append(Message("user", CUT_OFF if kind == "cut_off" else REMINDER))
             trace.event("reminder", step=step, kind=kind)
+            save()
             continue
-        reminders = 0
+        st.reminders = 0
 
-        for call in resp.message.tool_calls:
-            t0 = time.perf_counter()
-            decision, reason, approved, repeat = "allow", "", True, False
-            known = set(tools.names())
-            if call.name == FINISH or (tools.get(call.name) is None and _answer_in(call.arguments, known)):
-                answer = _answer_in(call.arguments, known)  # same rule as the check above, so nested answers are found too (B27)
-                if answer:
-                    r = try_finish(answer, step, "finish" if call.name == FINISH else "alias")
-                    if isinstance(r, RunResult):
-                        return r
-                    result = f"error: {r}"
-                else:
-                    result = "error: finish needs a non-empty 'answer'"
-            else:
-                decision, reason, approved, blocked = _gate(call, tools, approve)
-                result = blocked or tools.run(call.name, call.arguments)
-                key = _signature(call.name, call.arguments)
-                if seen.get(key):
-                    repeat = True
-                    result += REPEAT_NOTE.format(n=seen[key])
-                seen[key] = seen.get(key, 0) + 1
-            trace.event("tool", step=step, name=call.name, args=call.arguments, decision=decision, reason=reason,
-                        approved=approved, result=result, ms=round((time.perf_counter() - t0) * 1000), repeat=repeat)
-            log.info("  tool %s(%s) -> %s", call.name, call.arguments, _preview(result))
-            messages.append(Message("tool", result, tool_call_id=call.id, tool_name=call.name))
+        if (r := run_tools(resp.message)) is not None:
+            return r
 
     log.warning("hit max_steps=%d without finish", max_steps)
-    return RunResult("(stopped: step limit reached)", messages, max_steps, in_tok, out_tok, "max_steps")
+    return RunResult("(stopped: step limit reached)", messages, max_steps, st.in_tok, st.out_tok, "max_steps")
+
+# S8 resume: if the last assistant message has tool calls without results, run the rest.
+# A call that STARTED but didn't finish (st.pending) is re-run only if it's read-only; otherwise the model is told
+# it may or may not have happened (we can't know: the process died in the middle).
+def _resume_tools(st: RunState, tools: ToolRegistry, trace: Tracer, run_tools) -> RunResult | None:
+    last = next((i for i in range(len(st.messages) - 1, -1, -1) if st.messages[i].role == "assistant"), None)
+    if last is None or not st.messages[last].tool_calls:
+        return None
+    msg = st.messages[last]
+    done = sum(1 for m in st.messages[last + 1:] if m.role == "tool")
+    if done >= len(msg.tool_calls):
+        return None
+    start = done
+    if st.pending == start:
+        call = msg.tool_calls[start]
+        tool = tools.get(call.name)
+        if tool is None or tool.risk != "read":
+            trace.event("resume_interrupted_call", step=st.step, name=call.name, args=call.arguments)
+            st.messages.append(Message("tool", INTERRUPTED.format(name=call.name), tool_call_id=call.id, tool_name=call.name))
+            start += 1
+        st.pending = None
+    trace.event("resume_tools", step=st.step, remaining=len(msg.tool_calls) - start)
+    return run_tools(msg, start)
 
 # Before each model call: shrink the conversation if it's over budget. Out: the new `sent` index for the trace.
 # Compaction never touches the last turn, which holds every message added since the last call.

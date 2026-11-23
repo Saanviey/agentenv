@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 # One command the agent ran, and its outcome.
@@ -57,6 +57,19 @@ class Session:
             result = "timed out" if c.exit_code is None else f"exit code {c.exit_code}"
             lines.append(f"- last command: `{c.command}` -> {result} ({len(self.commands)} commands so far)")
         return "\n".join(lines)
+
+    # For checkpoints (S8): everything as plain JSON-able data.
+    def to_dict(self) -> dict:
+        return {"read": sorted(self.read), "snapshots": self.snapshots, "commands": [asdict(c) for c in self.commands],
+                "outputs": self.outputs, "seen": self.seen, "last_change": self.last_change, "clock": self._clock}
+
+    # Restores a checkpoint INTO this object (the tools keep a reference to it, so it can't be replaced).
+    def load_dict(self, d: dict) -> None:
+        self.read = set(d["read"])
+        self.snapshots = dict(d["snapshots"])
+        self.commands = [CommandRun(**c) for c in d["commands"]]
+        self.outputs, self.seen = list(d["outputs"]), list(d["seen"])
+        self.last_change, self._clock = d["last_change"], d["clock"]
 
     # Out: files whose content now differs from the start of the run.
     def changed(self) -> list[str]:
